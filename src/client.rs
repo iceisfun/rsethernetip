@@ -24,6 +24,15 @@ use crate::transport::{DirectTransport, ReconnectingTransport, Transport};
 // reconnection, or [`new_client`] with a custom transport.
 /// A high-level EtherNet/IP client that reads and writes PLC tags over TCP using explicit CIP
 /// messaging.
+/// Bytes of Multiple_Service_Packet request data per packet. Unconnected messages carry about 500
+/// bytes of CIP data on Logix; this leaves room for the packet's own path.
+const MULTI_READ_MAX_BYTES: usize = 480;
+/// Tags per packet. Replies share the same ~500 byte budget, so this keeps typical atomic-tag
+/// replies (BOOL..DINT) inside it; larger ones are re-read alone.
+const MULTI_READ_MAX_ITEMS: usize = 32;
+/// General status 0x1E: an embedded service in a Multiple_Service_Packet reported an error.
+const STATUS_EMBEDDED_SERVICE_ERROR: u8 = 0x1E;
+
 pub struct Client {
     transport: Arc<dyn Transport<Arc<Session>>>,
     pub(crate) logger: Arc<dyn Logger>,
@@ -255,59 +264,215 @@ impl Client {
     /// connection drop retries from scratch.
     pub fn list_tags(&self, ctx: &Context) -> Result<Vec<cip::SymbolInstance>> {
         self.do_op(ctx, |sess| {
-            let req_class = cip::new_get_symbol_class_attributes_request();
-            let resp_class = sess.send_cip_request(ctx, &req_class)?;
-            if !resp_class.is_success() {
-                // is_success() is false so error() is always Some.
-                return Err(match resp_class.error() {
-                    Some(e) => Error::Cip(e),
-                    None => Error::msg("symbol class attributes request failed"),
-                });
+            self.walk_symbols(ctx, sess, cip::new_get_symbol_class_attributes_request(), &|id| {
+                Ok(cip::new_get_symbol_attributes_request(id))
+            })
+        })
+    }
+
+    // Shared by controller and program enumeration: class query for the max instance, then one
+    // attribute query per instance. Transport failures abort so `do_op` resets the session;
+    // per-instance CIP failures skip that instance.
+    fn walk_symbols(
+        &self,
+        ctx: &Context,
+        sess: &Arc<Session>,
+        req_class: cip::MessageRouterRequest,
+        attr_req: &dyn Fn(u32) -> Result<cip::MessageRouterRequest>,
+    ) -> Result<Vec<cip::SymbolInstance>> {
+        let resp_class = sess.send_cip_request(ctx, &req_class)?;
+        if !resp_class.is_success() {
+            // is_success() is false so error() is always Some.
+            return Err(match resp_class.error() {
+                Some(e) => Error::Cip(e),
+                None => Error::msg("symbol class attributes request failed"),
+            });
+        }
+
+        let (_, max_instance) = cip::decode_symbol_class_attributes_response(&resp_class.response_data)
+            .map_err(|e| Error::wrap("failed to decode symbol class attributes", e.into()))?;
+
+        self.logger.info(format_args!("Max Symbol Instance: {}", max_instance));
+
+        let mut all_symbols = Vec::new();
+
+        for id in 1..=(max_instance as u32) {
+            if let Some(e) = ctx.err() {
+                return Err(Error::Plc(e));
             }
-
-            let (_, max_instance) = cip::decode_symbol_class_attributes_response(&resp_class.response_data)
-                .map_err(|e| Error::wrap("failed to decode symbol class attributes", e.into()))?;
-
-            self.logger.info(format_args!("Max Symbol Instance: {}", max_instance));
-
-            let mut all_symbols = Vec::new();
-
-            for id in 1..=(max_instance as u32) {
-                if let Some(e) = ctx.err() {
-                    return Err(Error::Plc(e));
-                }
-                let req = cip::new_get_symbol_attributes_request(id);
-                let resp = match sess.send_cip_request(ctx, &req) {
-                    Ok(r) => r,
-                    // Deviation from Go: transport failures abort so do_op resets the session.
-                    Err(e) if !matches!(e, Error::CipLayer(_) | Error::Cip(_)) => return Err(e),
-                    Err(e) => {
-                        self.logger.warn(format_args!("Failed to fetch attributes for instance {}: {}", id, e));
-                        continue;
-                    }
-                };
-
-                if !resp.is_success() {
-                    // Go distinguishes ObjectDoesNotExist / PathDestinationUnknown here but
-                    // skips the instance in every failure case.
+            let req = attr_req(id)?;
+            let resp = match sess.send_cip_request(ctx, &req) {
+                Ok(r) => r,
+                // Deviation from Go: transport failures abort so do_op resets the session.
+                Err(e) if !matches!(e, Error::CipLayer(_) | Error::Cip(_)) => return Err(e),
+                Err(e) => {
+                    self.logger.warn(format_args!("Failed to fetch attributes for instance {}: {}", id, e));
                     continue;
                 }
+            };
 
-                let (name, type_code) = match cip::decode_symbol_attributes_response(&resp.response_data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.logger.warn(format_args!("Failed to decode attributes for instance {}: {}", id, e));
-                        continue;
-                    }
-                };
-
-                if !name.is_empty() {
-                    all_symbols.push(cip::SymbolInstance { instance_id: id, name, type_: type_code });
-                }
+            if !resp.is_success() {
+                continue;
             }
 
-            Ok(all_symbols)
+            let (name, type_code) = match cip::decode_symbol_attributes_response(&resp.response_data) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.logger.warn(format_args!("Failed to decode attributes for instance {}: {}", id, e));
+                    continue;
+                }
+            };
+
+            if !name.is_empty() {
+                all_symbols.push(cip::SymbolInstance { instance_id: id, name, type_: type_code });
+            }
+        }
+
+        Ok(all_symbols)
+    }
+
+    // Ref: Rockwell 1756-PM020 Logix 5000 Data Access - each program has its own symbol table
+    // (see [`cip::new_get_symbol_attributes_request_in_program`]).
+    /// Enumerates the tags inside one program (e.g. `"MainProgram"`). Returned names are
+    /// program-relative; use [`list_all_tags`](Self::list_all_tags) for qualified names.
+    pub fn list_program_tags(&self, ctx: &Context, program: &str) -> Result<Vec<cip::SymbolInstance>> {
+        self.do_op(ctx, |sess| self.walk_program(ctx, sess, program))
+    }
+
+    fn walk_program(&self, ctx: &Context, sess: &Arc<Session>, program: &str) -> Result<Vec<cip::SymbolInstance>> {
+        let symbol = format!("Program:{program}");
+        let class_req = cip::new_get_symbol_class_attributes_request_in_program(&symbol)
+            .map_err(|e| Error::wrap("program symbol request", e.into()))?;
+        self.walk_symbols(ctx, sess, class_req, &|id| {
+            cip::new_get_symbol_attributes_request_in_program(&symbol, id)
+                .map_err(|e| Error::wrap("program symbol request", e.into()))
         })
+    }
+
+    /// Enumerates controller-scope tags plus every program's tags. Program tags are named
+    /// `Program:<program>.<tag>`; the `Program:<program>` symbols themselves are not returned.
+    pub fn list_all_tags(&self, ctx: &Context) -> Result<Vec<cip::SymbolInstance>> {
+        self.do_op(ctx, |sess| {
+            let controller = self.walk_symbols(ctx, sess, cip::new_get_symbol_class_attributes_request(), &|id| {
+                Ok(cip::new_get_symbol_attributes_request(id))
+            })?;
+            let mut out = Vec::with_capacity(controller.len());
+            let mut programs = Vec::new();
+            for sym in controller {
+                match cip::program_name(&sym.name) {
+                    Some(p) => programs.push(p.to_string()),
+                    None => out.push(sym),
+                }
+            }
+            for program in programs {
+                match self.walk_program(ctx, sess, &program) {
+                    Ok(tags) => out.extend(tags.into_iter().map(|mut t| {
+                        t.name = format!("Program:{program}.{}", t.name);
+                        t
+                    })),
+                    // An unreadable program must not hide the rest of the controller.
+                    Err(e @ (Error::CipLayer(_) | Error::Cip(_))) => {
+                        self.logger.warn(format_args!("Skipping program {program}: {e}"));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    // Ref: ODVA CIP Vol. 1 Multiple_Service_Packet (0x0A); unconnected messages carry roughly 500
+    // bytes of CIP data on Logix, so request size and an item cap bound each packet.
+    /// Reads one element of each named tag, batching reads into Multiple Service Packets.
+    ///
+    /// Returns one entry per input name, in order, each shaped like [`read_tag`](Self::read_tag)
+    /// (2-byte type code, then data). The outer `Result` fails only for session/transport
+    /// problems; a bad tag fails only its own entry. Controllers that reject the packet service,
+    /// and replies that do not fit, fall back to single reads for the affected tags.
+    pub fn read_tags(&self, ctx: &Context, names: &[&str]) -> Result<Vec<Result<Vec<u8>>>> {
+        let mut out: Vec<Option<Result<Vec<u8>>>> = (0..names.len()).map(|_| None).collect();
+
+        // (index into names, request, bytes it adds to a packet)
+        let mut pending = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let req = match cip::parse_tag_path(name) {
+                Ok(p) => cip::new_read_tag_request(p, 1),
+                Err(e) => {
+                    out[i] = Some(Err(e.into()));
+                    continue;
+                }
+            };
+            match req.encode() {
+                Ok(b) => pending.push((i, req, b.len() + 2)), // +2 for its offset entry
+                Err(e) => out[i] = Some(Err(e.into())),
+            }
+        }
+
+        let mut start = 0;
+        while start < pending.len() {
+            let mut end = start;
+            let mut bytes = 2; // count field
+            while end < pending.len()
+                && end - start < MULTI_READ_MAX_ITEMS
+                && (end == start || bytes + pending[end].2 <= MULTI_READ_MAX_BYTES)
+            {
+                bytes += pending[end].2;
+                end += 1;
+            }
+            self.read_chunk(ctx, names, &pending[start..end], &mut out)?;
+            start = end;
+        }
+
+        Ok(out.into_iter().map(|o| o.unwrap_or_else(|| Err(Error::msg("tag not read")))).collect())
+    }
+
+    fn read_chunk(
+        &self,
+        ctx: &Context,
+        names: &[&str],
+        chunk: &[(usize, cip::MessageRouterRequest, usize)],
+        out: &mut [Option<Result<Vec<u8>>>],
+    ) -> Result<()> {
+        // A lone request gains nothing from a packet.
+        if chunk.len() > 1 {
+            let reqs: Vec<cip::MessageRouterRequest> = chunk.iter().map(|c| c.1.clone()).collect();
+            let replies = self.do_op(ctx, |sess| {
+                let msp = match cip::new_multiple_service_request(&reqs) {
+                    Ok(m) => m,
+                    Err(_) => return Ok(None),
+                };
+                let resp = sess.send_cip_request(ctx, &msp)?;
+                // 0x1E = at least one embedded service failed; the replies are still present.
+                if !resp.is_success() && resp.general_status != STATUS_EMBEDDED_SERVICE_ERROR {
+                    return Ok(None);
+                }
+                Ok(cip::decode_multiple_service_response(&resp.response_data).ok())
+            });
+            match replies {
+                Ok(Some(r)) if r.len() == chunk.len() => {
+                    for ((i, _, _), resp) in chunk.iter().zip(r) {
+                        out[*i] = match resp.general_status {
+                            cip::STATUS_SUCCESS => Some(Ok(resp.response_data)),
+                            cip::STATUS_PARTIAL_TRANSFER | cip::STATUS_REPLY_DATA_TOO_LARGE => None, // read alone below
+                            _ => Some(Err(resp.error().map(Error::Cip).unwrap_or_else(|| Error::msg("read failed")))),
+                        };
+                    }
+                }
+                Ok(_) => {} // packet refused or unreadable: read each tag alone below
+                Err(e) if matches!(e, Error::CipLayer(_) | Error::Cip(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        for (i, _, _) in chunk {
+            if out[*i].is_none() {
+                out[*i] = Some(match self.read_tag(ctx, names[*i]) {
+                    Err(e) if !matches!(e, Error::CipLayer(_) | Error::Cip(_)) => return Err(e),
+                    r => r,
+                });
+            }
+        }
+        Ok(())
     }
 
     // ---------- Internal retry loop ----------
@@ -323,6 +488,8 @@ impl Client {
     // observe `ctx`.
     pub(crate) fn do_op<T>(&self, ctx: &Context, mut op: impl FnMut(&Arc<Session>) -> Result<T>) -> Result<T> {
         let mut i: i32 = 0;
+        // Deviation from Go: the final error carries the last cause instead of only a count.
+        let mut last_err: Option<String> = None;
         while self.retries < 0 || i <= self.retries {
             let sess = match self.transport.conn(ctx) {
                 Ok(s) => s,
@@ -330,6 +497,7 @@ impl Client {
                     if self.retries == 0 {
                         return Err(err);
                     }
+                    last_err = Some(err.to_string());
                     self.logger.warn(format_args!("Session unavailable (attempt {}): {}", i.wrapping_add(1), err));
                     if self.retries < 0 || i < self.retries {
                         self.sleep_retry(ctx)?;
@@ -352,6 +520,7 @@ impl Client {
             // Transport error: reset and retry.
             let _ = self.transport.reset(&sess);
             self.logger.warn(format_args!("Operation failed (attempt {}): {}", i.wrapping_add(1), err));
+            last_err = Some(err.to_string());
 
             if self.retries < 0 || i < self.retries {
                 self.sleep_retry(ctx)?;
@@ -364,7 +533,11 @@ impl Client {
             i = i.wrapping_add(1);
         }
 
-        Err(Error::msg(format!("operation failed after {} retries", self.retries as i64 + 1)))
+        let attempts = self.retries as i64 + 1;
+        Err(Error::msg(match last_err {
+            Some(cause) => format!("operation failed after {attempts} attempts: {cause}"),
+            None => format!("operation failed after {attempts} attempts"),
+        }))
     }
 
     // Implementation detail: sleeps `retry_delay` in slices, returning the context error if `ctx`
@@ -698,6 +871,19 @@ mod tests {
         assert_eq!(t.requests.load(Ordering::SeqCst) - before, 1);
     }
 
+
+    #[test]
+    fn exhausted_retries_report_the_last_cause() {
+        // Nothing listens on port 1, so every dial is refused.
+        let c = new_reconnecting_client(
+            "127.0.0.1:1",
+            vec![with_retries(1).into(), with_retry_delay(Duration::from_millis(1)).into()],
+        );
+        let err = c.read_tag(&ctx(), "T").unwrap_err().to_string();
+        assert!(err.contains("after 2 attempts"), "{err}");
+        assert!(err.to_lowercase().contains("refused") || err.contains("127.0.0.1"), "cause missing: {err}");
+    }
+
     #[test]
     fn plc_trait_lifecycle() {
         let (_t, client) = connect_pair(symbolic_router(vec![0xC1, 0, 1]));
@@ -715,6 +901,199 @@ mod tests {
         assert_eq!(id[0].product_name, "FakeTarget");
         let sv = client.list_services(&ctx()).unwrap();
         assert_eq!(sv[0].name, "Communications");
+    }
+
+
+    // Router with a controller table [Program:MainProgram, Ctl_Tag] and a MainProgram table
+    // [Pre_Diverter_PE_1 BOOL]. Program requests start with the 0x91 symbolic segment.
+    fn program_router() -> Arc<MessageRouter> {
+        fn attrs(name: &str, ty: u16) -> Vec<u8> {
+            let mut v = vec![2, 0, 1, 0, 0, 0];
+            v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            v.extend_from_slice(name.as_bytes());
+            v.extend_from_slice(&[2, 0, 0, 0]);
+            v.extend_from_slice(&ty.to_le_bytes());
+            v
+        }
+        fn class(max: u16) -> Vec<u8> {
+            let mut v = vec![2, 0, 1, 0, 0, 0, 3, 0, 2, 0, 0, 0];
+            v.extend_from_slice(&max.to_le_bytes());
+            v
+        }
+        let router = Arc::new(MessageRouter::new());
+        router.register_object(
+            cip::CLASS_SYMBOL,
+            MockObject::new(|_svc, path, _data| match path.bytes() {
+                [0x24, 0] => Ok(class(2)),
+                [0x24, 1] => Ok(attrs("Program:MainProgram", 0x8068)),
+                [0x24, 2] => Ok(attrs("Ctl_Tag", 0xC4)),
+                _ => Err(cip::Error::new(cip::STATUS_OBJECT_DOES_NOT_EXIST).into()),
+            }),
+        );
+        router.register_symbolic_handler(MockObject::new(|_svc, path, _data| {
+            let b = path.bytes();
+            if !b.windows(19).any(|w| w == b"Program:MainProgram") {
+                return Err(cip::Error::new(cip::STATUS_PATH_DESTINATION_UNKNOWN).into());
+            }
+            match &b[b.len() - 2..] {
+                [0x24, 0] => Ok(class(1)),
+                [0x24, 1] => Ok(attrs("Pre_Diverter_PE_1", 0xC1)),
+                _ => Err(cip::Error::new(cip::STATUS_OBJECT_DOES_NOT_EXIST).into()),
+            }
+        }));
+        router
+    }
+
+    #[test]
+    fn list_program_tags_walks_the_program_table() {
+        let (_t, client) = connect_pair(program_router());
+        let tags = client.list_program_tags(&ctx(), "MainProgram").unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!((tags[0].name.as_str(), tags[0].type_), ("Pre_Diverter_PE_1", TYPE_BOOL));
+    }
+
+    #[test]
+    fn list_all_tags_qualifies_program_tags_and_drops_program_symbols() {
+        let (_t, client) = connect_pair(program_router());
+        let names: Vec<String> = client.list_all_tags(&ctx()).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["Ctl_Tag", "Program:MainProgram.Pre_Diverter_PE_1"]);
+    }
+
+    #[test]
+    fn list_all_tags_survives_a_program_that_cannot_be_read() {
+        // The symbolic handler rejects every path, so the program table is unreadable; the
+        // controller tags must still come back.
+        let router = Arc::new(MessageRouter::new());
+        router.register_object(
+            cip::CLASS_SYMBOL,
+            MockObject::new(|_svc, path, _data| match path.bytes() {
+                [0x24, 0] => Ok(vec![2, 0, 1, 0, 0, 0, 3, 0, 2, 0, 0, 0, 1, 0]),
+                [0x24, 1] => {
+                    let mut v = vec![2, 0, 1, 0, 0, 0, 19, 0];
+                    v.extend_from_slice(b"Program:MainProgram");
+                    v.extend_from_slice(&[2, 0, 0, 0, 0x68, 0x80]);
+                    Ok(v)
+                }
+                _ => Err(cip::Error::new(cip::STATUS_OBJECT_DOES_NOT_EXIST).into()),
+            }),
+        );
+        router.register_symbolic_handler(MockObject::new(|_, _, _| {
+            Err(cip::Error::new(cip::STATUS_PATH_DESTINATION_UNKNOWN).into())
+        }));
+        let (_t, client) = connect_pair(router);
+        assert!(client.list_all_tags(&ctx()).unwrap().is_empty());
+    }
+
+
+    // "Program:Main.Tag" is sent as one 0x91 segment per dotted part; rejoin them.
+    fn tag_name_of(path: &[u8]) -> String {
+        let (mut parts, mut p) = (Vec::new(), 0);
+        while p < path.len() && path[p] == 0x91 {
+            let l = path[p + 1] as usize;
+            parts.push(std::str::from_utf8(&path[p + 2..p + 2 + l]).unwrap().to_string());
+            p += 2 + l + (l % 2);
+        }
+        parts.join(".")
+    }
+
+    // Target that answers Multiple_Service_Packet on the Message Router (class 0x02) and single
+    // Read Tag via the symbolic handler. `lookup(tag)`: Some(bytes) = success data, None = status 4.
+    fn msp_router(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        lookup: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> Arc<MessageRouter> {
+        let lookup = Arc::new(lookup);
+        let router = Arc::new(MessageRouter::new());
+        let l = lookup.clone();
+        router.register_object(
+            cip::CLASS_MESSAGE_ROUTER,
+            MockObject::new(move |svc, _path, data| {
+                assert_eq!(svc, 0x0A);
+                calls.fetch_add(1, Ordering::SeqCst);
+                let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+                let off = |i: usize| u16::from_le_bytes([data[2 + 2 * i], data[3 + 2 * i]]) as usize;
+                let mut replies: Vec<Vec<u8>> = Vec::new();
+                for i in 0..count {
+                    let end = if i + 1 < count { off(i + 1) } else { data.len() };
+                    let req = cip::decode_message_router_request(&data[off(i)..end]).unwrap();
+                    replies.push(match l(&tag_name_of(req.request_path.bytes())) {
+                        Some(d) => [vec![0xCC, 0, 0, 0], d].concat(),
+                        None => vec![0xCC, 0, 0x04, 0],
+                    });
+                }
+                let mut out = (count as u16).to_le_bytes().to_vec();
+                let mut o = 2 + 2 * count;
+                for r in &replies {
+                    out.extend_from_slice(&(o as u16).to_le_bytes());
+                    o += r.len();
+                }
+                for r in &replies {
+                    out.extend_from_slice(r);
+                }
+                Ok(out)
+            }),
+        );
+        router.register_symbolic_handler(MockObject::new(move |_svc, path, _data| {
+            lookup(&tag_name_of(path.bytes())).ok_or_else(|| cip::Error::new(cip::STATUS_PATH_SEGMENT_ERROR).into())
+        }));
+        router
+    }
+
+    #[test]
+    fn read_tags_returns_each_tag_in_order_with_per_tag_errors() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router = msp_router(calls.clone(), |n| match n {
+            "A" => Some(vec![0xC1, 0, 1]),
+            "B" => Some(vec![0xC4, 0, 5, 0, 0, 0]),
+            _ => None,
+        });
+        let (_t, client) = connect_pair(router);
+        let r = client.read_tags(&ctx(), &["A", "Missing", "B"]).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].as_ref().unwrap(), &vec![0xC1, 0, 1]);
+        assert!(matches!(r[1], Err(Error::Cip(_))));
+        assert_eq!(r[2].as_ref().unwrap(), &vec![0xC4, 0, 5, 0, 0, 0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one round trip for three tags");
+    }
+
+    #[test]
+    fn read_tags_splits_large_batches_across_packets() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router = msp_router(calls.clone(), |n| Some(vec![0xC4, 0, n.len() as u8, 0, 0, 0]));
+        let (_t, client) = connect_pair(router);
+        let names: Vec<String> = (0..100).map(|i| format!("Program:MainProgram.Pre_Diverter_PE_{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let r = client.read_tags(&ctx(), &refs).unwrap();
+        assert_eq!(r.len(), 100);
+        for (n, v) in names.iter().zip(&r) {
+            assert_eq!(v.as_ref().unwrap()[2], n.len() as u8, "{n}");
+        }
+        let n = calls.load(Ordering::SeqCst);
+        assert!(n > 1 && n < 100, "expected a handful of packets, got {n}");
+    }
+
+    #[test]
+    fn read_tags_with_no_names_makes_no_request() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_t, client) = connect_pair(msp_router(calls.clone(), |_| None));
+        assert!(client.read_tags(&ctx(), &[]).unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn read_tags_falls_back_to_single_reads_when_the_packet_is_rejected() {
+        // No class 0x02 object: the packet fails; the symbolic handler answers single reads.
+        let (_t, client) = connect_pair(symbolic_router(vec![0xC1, 0, 1]));
+        let r = client.read_tags(&ctx(), &["A", "B"]).unwrap();
+        assert!(r.iter().all(|x| x.as_ref().unwrap() == &vec![0xC1, 0, 1]));
+    }
+
+    #[test]
+    fn read_tags_reports_an_unparseable_name_on_its_own_entry() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_t, client) = connect_pair(msp_router(calls, |_| Some(vec![0xC1, 0, 1])));
+        let r = client.read_tags(&ctx(), &["A", "", "B"]).unwrap();
+        assert!(r[0].is_ok() && r[1].is_err() && r[2].is_ok());
     }
 
     #[test]
@@ -755,7 +1134,7 @@ mod tests {
         );
         assert!(!c.is_connected(), "constructor must not dial");
         let e = c.read_tag(&ctx(), "T").unwrap_err();
-        assert_eq!(e.to_string(), "operation failed after 3 retries");
+        assert!(e.to_string().starts_with("operation failed after 3 attempts: "), "{e}");
         assert!(t.accepted.load(Ordering::SeqCst) >= 3, "should have reconnected per attempt");
 
         // Heal the target: next call reconnects and succeeds.
@@ -766,14 +1145,15 @@ mod tests {
         c.close().unwrap();
     }
 
-    // Go quirk: retries == 0 and an operation failure reports "operation failed after 1 retries".
+    // Go quirk: retries == 0 and an operation failure reports "operation failed after 1 attempts"
+    // (with the cause appended here; Go reported only the count).
     #[test]
     fn no_retries_operation_failure_message() {
         let t = FakeTarget::start(symbolic_router(vec![0xC1, 0, 0]));
         t.drop_after.store(1, Ordering::SeqCst);
         let c = new_reconnecting_client(&t.addr, vec![]);
         let e = c.read_tag(&ctx(), "T").unwrap_err();
-        assert_eq!(e.to_string(), "operation failed after 1 retries");
+        assert!(e.to_string().starts_with("operation failed after 1 attempts"), "{e}");
     }
 
     #[test]

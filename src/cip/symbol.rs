@@ -164,9 +164,72 @@ pub fn decode_symbol_attributes_response(data: &[u8]) -> Result<(String, DataTyp
     Ok((name, DataType(type_code)))
 }
 
+// Ref: Rockwell 1756-PM020 Logix 5000 Data Access - program-scoped tags live in a per-program
+// symbol table, addressed by prefixing the Symbol Object path with the "Program:<name>"
+// symbolic segment. Unlike the controller table it is not reachable through the plain 0x6B path.
+// Returns `Get_Attribute_List` for the program's symbol class (instance 0).
+pub fn new_get_symbol_class_attributes_request_in_program(program: &str) -> Result<MessageRouterRequest> {
+    let mut req = new_get_symbol_class_attributes_request();
+    req.request_path = program_symbol_path(program, 0)?;
+    Ok(req)
+}
+
+// Same as [`new_get_symbol_attributes_request`] but for one instance of a program's symbol table.
+pub fn new_get_symbol_attributes_request_in_program(program: &str, instance_id: u32) -> Result<MessageRouterRequest> {
+    let mut req = new_get_symbol_attributes_request(instance_id);
+    req.request_path = program_symbol_path(program, instance_id)?;
+    Ok(req)
+}
+
+// [symbolic "Program:<name>"] [class 0x6B] [instance]
+fn program_symbol_path(program: &str, instance_id: u32) -> Result<Path> {
+    let mut p = Path::new();
+    p.add_symbolic_segment(program)?;
+    p.add_class(CLASS_SYMBOL);
+    p.add_instance32(instance_id);
+    Ok(p)
+}
+
+// Controller-scope symbols named "Program:<name>" are the programs themselves. Returns that name.
+pub fn program_name(symbol_name: &str) -> Option<&str> {
+    let name = symbol_name.strip_prefix("Program:")?;
+    (!name.is_empty() && !name.contains('.')).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn program_class_attributes_request_prefixes_the_symbolic_segment() {
+        let req = new_get_symbol_class_attributes_request_in_program("Program:Main").unwrap();
+        let mut want = vec![0x91, 12];
+        want.extend_from_slice(b"Program:Main");
+        want.extend_from_slice(&[0x20, 0x6B, 0x24, 0x00]);
+        assert_eq!(req.request_path.bytes(), want.as_slice());
+        assert_eq!(req.service, 0x03);
+        assert_eq!(req.request_data, vec![2, 0, 1, 0, 2, 0]);
+    }
+
+    #[test]
+    fn program_attributes_request_pads_odd_names_and_uses_the_instance() {
+        let req = new_get_symbol_attributes_request_in_program("Program:Mai", 0x0102).unwrap();
+        let mut want = vec![0x91, 11];
+        want.extend_from_slice(b"Program:Mai");
+        want.push(0x00); // pad
+        want.extend_from_slice(&[0x20, 0x6B, 0x25, 0x00, 0x02, 0x01]); // 16-bit instance
+        assert_eq!(req.request_path.bytes(), want.as_slice());
+        assert_eq!(req.request_data, vec![2, 0, 1, 0, 2, 0]);
+    }
+
+    #[test]
+    fn program_names_are_recognised() {
+        assert_eq!(program_name("Program:MainProgram"), Some("MainProgram"));
+        assert_eq!(program_name("Program:"), None);
+        assert_eq!(program_name("Pre_Diverter_PE_1"), None);
+        assert_eq!(program_name("Program:Main.Tag"), None, "a member path is not a program");
+    }
 
     // Ref: Rockwell 1756-PM020 Symbol Object class attributes (Go has no direct test; added).
     #[test]
