@@ -139,4 +139,74 @@ mod tests {
         assert!(decode_multiple_service_response(&[1, 0]).is_err(), "missing offset");
         assert!(decode_multiple_service_response(&[1, 0, 99, 0, 0xCC, 0, 0, 0]).is_err(), "offset past end");
     }
+
+    fn reply(status: u8) -> Vec<u8> {
+        vec![0xCC, 0, status, 0]
+    }
+
+    #[test]
+    fn oversize_packets_are_rejected() {
+        let big = MessageRouterRequest { request_data: vec![0; 1000], ..read("A") };
+        assert!(new_multiple_service_request(&vec![big; 70]).is_err(), "total over 65535 bytes");
+        let many = vec![read("A"); u16::MAX as usize + 1];
+        assert!(new_multiple_service_request(&many).is_err(), "more than 65535 requests");
+    }
+
+    #[test]
+    fn zero_count_decodes_to_no_replies() {
+        assert!(decode_multiple_service_response(&[0, 0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bad_offsets_are_errors() {
+        let ok = reply(0);
+        let with = |offsets: &[u16], tail: &[u8]| {
+            let mut d = (offsets.len() as u16).to_le_bytes().to_vec();
+            for o in offsets {
+                d.extend_from_slice(&o.to_le_bytes());
+            }
+            d.extend_from_slice(tail);
+            d
+        };
+        // 2 replies: header is 6 bytes, so valid offsets are 6 and 10.
+        let tail = [ok.clone(), ok.clone()].concat();
+        assert_eq!(decode_multiple_service_response(&with(&[6, 10], &tail)).unwrap().len(), 2);
+        assert!(decode_multiple_service_response(&with(&[10, 6], &tail)).is_err(), "decreasing offsets");
+        assert!(decode_multiple_service_response(&with(&[2, 10], &tail)).is_err(), "first offset inside the table");
+        assert!(decode_multiple_service_response(&with(&[6, 14], &tail)).is_err(), "offset at the end: empty reply");
+        assert!(decode_multiple_service_response(&with(&[6, 10], &[ok.clone(), vec![0xCC, 0]].concat())).is_err(), "truncated reply");
+    }
+
+    #[test]
+    fn replies_decode_when_wrapped_in_an_embedded_error_status() {
+        // Logix answers 0x1E and still carries every embedded reply.
+        let mut body = vec![2, 0, 6, 0, 10, 0];
+        body.extend_from_slice(&reply(0));
+        body.extend_from_slice(&reply(0x04));
+        let outer = MessageRouterResponse {
+            service: 0x8A,
+            general_status: STATUS_EMBEDDED_SERVICE_ERROR,
+            response_data: body,
+            ..Default::default()
+        };
+        let parsed = decode_message_router_response(&outer.encode().unwrap()).unwrap();
+        assert!(!parsed.is_success());
+        let r = decode_multiple_service_response(&parsed.response_data).unwrap();
+        assert_eq!((r[0].general_status, r[1].general_status), (0, 0x04));
+    }
+
+    #[test]
+    fn encoded_request_round_trips_through_the_decoder() {
+        let reads: Vec<_> = ["A", "Bb", "Program:Main.Ccc", "D.e[3]"].into_iter().map(read).collect();
+        let req = new_multiple_service_request(&reads).unwrap();
+        // Treat each embedded request as a reply-shaped blob: offsets must slice it exactly.
+        let data = &req.request_data;
+        let count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        assert_eq!(count, reads.len());
+        for (i, r) in reads.iter().enumerate() {
+            let start = u16::from_le_bytes([data[2 + 2 * i], data[3 + 2 * i]]) as usize;
+            let want = r.encode().unwrap();
+            assert_eq!(&data[start..start + want.len()], &want[..], "request {i}");
+        }
+    }
 }
