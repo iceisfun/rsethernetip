@@ -265,6 +265,9 @@ pub const STATUS_SUCCESS: USINT = 0x00;
 pub const STATUS_PATH_DESTINATION_UNKNOWN: USINT = 0x05;
 // Ref: CIP Vol. 1, Appendix B General Status Codes: 0x06 Partial transfer.
 pub const STATUS_PARTIAL_TRANSFER: USINT = 0x06;
+// Ref: CIP Vol. 1, Appendix B General Status Codes: 0x1E Embedded service error (a service inside
+// a Multiple_Service_Packet failed; the embedded replies are still present).
+pub const STATUS_EMBEDDED_SERVICE_ERROR: USINT = 0x1E;
 // Ref: CIP Vol. 1, Appendix B General Status Codes: 0x1C is "Missing attribute list entry data"
 // (the Go source names it AttributeListShortage).
 pub const STATUS_ATTRIBUTE_LIST_SHORTAGE: USINT = 0x1C;
@@ -546,6 +549,7 @@ mod tests {
         assert_eq!(STATUS_PRIVILEGE_VIOLATION, 0x0F);
         assert_eq!(STATUS_DEVICE_STATE_CONFLICT, 0x10);
         assert_eq!(STATUS_REPLY_DATA_TOO_LARGE, 0x11);
+        assert_eq!(STATUS_EMBEDDED_SERVICE_ERROR, 0x1E);
     }
 
     // Ref: Go TestStatusCodesExist - CIP Vol. 1, Appendix B General Status Codes.

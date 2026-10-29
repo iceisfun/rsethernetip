@@ -17,6 +17,22 @@ use crate::plc::{self, ByteOrder, Context, DataPoint, Value};
 use crate::session::Session;
 use crate::transport::{DirectTransport, ReconnectingTransport, Transport};
 
+// Ref: ODVA CIP Vol. 1 Multiple_Service_Packet (0x0A); the ~500 byte unconnected data size is the
+// practical Logix limit (not a spec constant).
+/// CIP bytes an unconnected message can carry on Logix.
+const MULTI_READ_UNCONNECTED_BYTES: usize = 500;
+/// The packet's own framing outside the request data: service (1), path size (1) and the
+/// 4-byte Message Router path (class 0x02, instance 1).
+const MULTI_READ_PACKET_OVERHEAD: usize = 1 + 1 + 4;
+/// Slack kept below the limit for controllers that count a little differently.
+const MULTI_READ_SLACK: usize = 14;
+/// Bytes of Multiple_Service_Packet request data per packet: the count field, the offset table
+/// and the embedded requests (500 - 6 - 14 = 480).
+const MULTI_READ_MAX_BYTES: usize = MULTI_READ_UNCONNECTED_BYTES - MULTI_READ_PACKET_OVERHEAD - MULTI_READ_SLACK;
+/// Tags per packet. Replies share the same ~500 byte budget, so this keeps typical atomic-tag
+/// replies (BOOL..DINT) inside it; larger ones are re-read alone.
+const MULTI_READ_MAX_ITEMS: usize = 32;
+
 // Ref: Rockwell 1756-PM020 Logix 5000 Data Access - Read Tag (0x4C) / Write Tag (0x4D) services
 // addressed by symbolic tag path; CIP Vol. 2 explicit messaging over SendRRData.
 // Implementation detail: sessions come from a pluggable transport; the client implements
@@ -24,15 +40,6 @@ use crate::transport::{DirectTransport, ReconnectingTransport, Transport};
 // reconnection, or [`new_client`] with a custom transport.
 /// A high-level EtherNet/IP client that reads and writes PLC tags over TCP using explicit CIP
 /// messaging.
-/// Bytes of Multiple_Service_Packet request data per packet. Unconnected messages carry about 500
-/// bytes of CIP data on Logix; this leaves room for the packet's own path.
-const MULTI_READ_MAX_BYTES: usize = 480;
-/// Tags per packet. Replies share the same ~500 byte budget, so this keeps typical atomic-tag
-/// replies (BOOL..DINT) inside it; larger ones are re-read alone.
-const MULTI_READ_MAX_ITEMS: usize = 32;
-/// General status 0x1E: an embedded service in a Multiple_Service_Packet reported an error.
-const STATUS_EMBEDDED_SERVICE_ERROR: u8 = 0x1E;
-
 pub struct Client {
     transport: Arc<dyn Transport<Arc<Session>>>,
     pub(crate) logger: Arc<dyn Logger>,
@@ -443,7 +450,7 @@ impl Client {
                 };
                 let resp = sess.send_cip_request(ctx, &msp)?;
                 // 0x1E = at least one embedded service failed; the replies are still present.
-                if !resp.is_success() && resp.general_status != STATUS_EMBEDDED_SERVICE_ERROR {
+                if !resp.is_success() && resp.general_status != cip::STATUS_EMBEDDED_SERVICE_ERROR {
                     return Ok(None);
                 }
                 Ok(cip::decode_multiple_service_response(&resp.response_data).ok())
