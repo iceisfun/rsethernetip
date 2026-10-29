@@ -200,7 +200,6 @@ pub fn program_name(symbol_name: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-
     #[test]
     fn program_class_attributes_request_prefixes_the_symbolic_segment() {
         let req = new_get_symbol_class_attributes_request_in_program("Program:Main").unwrap();

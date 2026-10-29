@@ -878,7 +878,6 @@ mod tests {
         assert_eq!(t.requests.load(Ordering::SeqCst) - before, 1);
     }
 
-
     #[test]
     fn exhausted_retries_report_the_last_cause() {
         // Nothing listens on port 1, so every dial is refused.
@@ -909,7 +908,6 @@ mod tests {
         let sv = client.list_services(&ctx()).unwrap();
         assert_eq!(sv[0].name, "Communications");
     }
-
 
     // Router with a controller table [Program:MainProgram, Ctl_Tag] and a MainProgram table
     // [Pre_Diverter_PE_1 BOOL]. Program requests start with the 0x91 symbolic segment.
@@ -990,7 +988,6 @@ mod tests {
         let (_t, client) = connect_pair(router);
         assert!(client.list_all_tags(&ctx()).unwrap().is_empty());
     }
-
 
     // "Program:Main.Tag" is sent as one 0x91 segment per dotted part; rejoin them.
     fn tag_name_of(path: &[u8]) -> String {
