@@ -236,6 +236,10 @@ pub(crate) mod fixture {
         }
     }
 
+    // Implementation detail: answers a request itself, bypassing the router (None = dispatch
+    // normally). Lets tests produce replies an `Object` cannot, such as status 0x1E with data.
+    pub type RawResponder = Arc<dyn Fn(&cip::MessageRouterRequest) -> Option<MessageRouterResponse> + Send + Sync>;
+
     // Implementation detail: handle to a running fake target.
     pub struct FakeTarget {
         pub addr: String,
@@ -251,6 +255,10 @@ pub(crate) mod fixture {
 
     impl FakeTarget {
         pub fn start(router: Arc<MessageRouter>) -> FakeTarget {
+            Self::start_with(router, None)
+        }
+
+        pub fn start_with(router: Arc<MessageRouter>, raw: Option<RawResponder>) -> FakeTarget {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let addr = listener.local_addr().unwrap().to_string();
             listener.set_nonblocking(true).unwrap();
@@ -270,9 +278,9 @@ pub(crate) mod fixture {
                         Ok((s, _)) => {
                             accepted.fetch_add(1, Ordering::SeqCst);
                             let _ = s.set_nonblocking(false);
-                            let (router, stop, nh) = (router.clone(), stop.clone(), next_handle.clone());
+                            let (router, stop, nh, raw) = (router.clone(), stop.clone(), next_handle.clone(), raw.clone());
                             let (da, rq) = (drop_after.clone(), requests.clone());
-                            std::thread::spawn(move || serve(s, router, stop, nh, da, rq));
+                            std::thread::spawn(move || serve(s, router, raw, stop, nh, da, rq));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5))
@@ -310,6 +318,7 @@ pub(crate) mod fixture {
     fn serve(
         mut s: TcpStream,
         router: Arc<MessageRouter>,
+        raw: Option<RawResponder>,
         stop: Arc<AtomicBool>,
         next_handle: Arc<AtomicU32>,
         drop_after: Arc<AtomicUsize>,
@@ -356,7 +365,7 @@ pub(crate) mod fixture {
                         let cpf = CommonPacketFormat::decode(data.get(6..)?).ok()?;
                         let item = cpf.find_item_by_type(eip::ITEM_ID_UNCONNECTED_MESSAGE)?;
                         let req = cip::decode_message_router_request(&item.data).ok()?;
-                        let resp = match router.dispatch(&req) {
+                        let resp = match raw.as_ref().and_then(|f| f(&req)).map(Ok).unwrap_or_else(|| router.dispatch(&req)) {
                             Ok(r) => r,
                             Err(e) => MessageRouterResponse {
                                 service: req.service | 0x80,
