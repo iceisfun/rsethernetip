@@ -10,8 +10,13 @@
 //! Ref: Rockwell 1756-PM020 Logix 5000 Data Access - Symbol Object (class 0x6B); CIP Vol. 1,
 //! Section 3-5 Common Services - Get_Attribute_List (service code 0x03) (section unverified).
 //!
+//! Program-scoped tags live in per-program symbol tables: `-program <name>` lists one program's
+//! tags, `-program all` lists controller tags plus every program's (named `Program:<name>.<tag>`).
+//!
 //! Usage:
 //!   ethernetip-list-tags -addr 192.168.1.10:44818
+//!   ethernetip-list-tags -addr 192.168.1.10:44818 -program MainProgram
+//!   ethernetip-list-tags -addr 192.168.1.10:44818 -program all
 
 use std::time::Duration;
 
@@ -21,10 +26,12 @@ use rsethernetip::options::{with_retries, with_retry_delay};
 use rsethernetip::plc::Context;
 
 fn main() {
-    let args = Cli::new("ethernetip-list-tags", "Enumerates all tags on a Logix PLC.")
+    let args = Cli::new("ethernetip-list-tags", "Enumerates tags on a Logix PLC.")
         .flag("addr", "192.168.1.10:44818", "PLC address in host:port format")
+        .flag("program", "", "Program name to list, or \"all\" for controller plus every program; empty lists controller scope")
         .parse_env();
     let addr = args.str("addr").to_string();
+    let program = args.str("program").to_string();
 
     // A longer timeout: listing tags is one CIP request per instance ID.
     let ctx = Context::background().with_timeout(Duration::from_secs(60));
@@ -42,7 +49,12 @@ fn main() {
     println!();
 
     // The whole enumeration runs inside one retry-able operation (restarts at instance 1).
-    let tags = match client.list_tags(&ctx) {
+    let tags = match program.as_str() {
+        "" => client.list_tags(&ctx),
+        "all" => client.list_all_tags(&ctx),
+        p => client.list_program_tags(&ctx, p),
+    };
+    let tags = match tags {
         Ok(t) => t,
         Err(e) => cli::fatal(format!("ListTags failed: {e}")),
     };

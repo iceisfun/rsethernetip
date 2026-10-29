@@ -54,6 +54,21 @@ println!("{} / {}", t.acc, t.pre);
 for s in c.list_tags(&ctx)? { println!("{} {}", s.name, s.type_); }
 ```
 
+Program-scoped tags and batched reads:
+
+```rust
+// Controller scope plus every program; program tags come back as "Program:<name>.<tag>".
+for s in c.list_all_tags(&ctx)? { println!("{} {}", s.name, s.type_); }
+// One program's tags (bare name or "Program:Main"), names relative to the program.
+let main_tags = c.list_program_tags(&ctx, "Main")?;
+// Many tags in few round trips (Multiple Service Packet); one entry per name, in order.
+// Each entry is the 2-byte type code followed by the data, like read_tag.
+let names = ["MyDINT", "Program:Main.Count"];
+for (name, r) in names.iter().zip(c.read_tags(&ctx, &names)?) {
+    println!("{name}: {:?}", r); // r is a per-tag Result<Vec<u8>>
+}
+```
+
 Serve tags (any `cip::Object` can be registered under a class or as the symbolic handler):
 
 ```rust
