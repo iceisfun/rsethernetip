@@ -183,8 +183,8 @@ fn offline_demo() {
 
     println!();
     println!("Simulated ListTags output:");
-    println!("  {:<10}  {:<40}  {} (0x{:04X})", "Instance", "Name", "Type", 0);
-    println!("  {:<10}  {:<40}  {} (0x{:04X})", "--------", "----", "----", 0);
+    println!("  {:<10}  {:<40}  Type (0x{:04X})", "Instance", "Name", 0);
+    println!("  {:<10}  {:<40}  ---- (0x{:04X})", "--------", "----", 0);
     println!("  {:<10}  {:<40}  {} (0x{:04X})", 432, "MyCustomTimer", DataType(0xAF83), 0xAF83u16);
     println!("  {:<10}  {:<40}  {} (0x{:04X})", 100, "MyDINT", DataType(0x00C4), 0x00C4u16);
 }

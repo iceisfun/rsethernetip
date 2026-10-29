@@ -170,7 +170,7 @@ impl Path {
         self.0.push(0x91); // Extended Symbol Segment (Data Segment 0x80 | 0x11)
         self.0.push(l as u8);
         self.0.extend_from_slice(symbol.as_bytes());
-        if l % 2 != 0 {
+        if !l.is_multiple_of(2) {
             self.0.push(0x00); // Pad to even length
         }
         Ok(())
@@ -221,7 +221,7 @@ impl Path {
         self.0.extend_from_slice(link_address);
 
         // Pad to 16-bit word boundary if the segment length is odd
-        if (self.0.len() - seg_start) % 2 != 0 {
+        if !(self.0.len() - seg_start).is_multiple_of(2) {
             self.0.push(0x00);
         }
         Ok(())
@@ -247,14 +247,14 @@ impl Path {
     // (section unverified). Returns the path length in 16-bit words (truncated to a byte);
     // use `try_len_words` to reject paths over 510 bytes.
     pub fn len_words(&self) -> u8 {
-        ((self.0.len() + 1) / 2) as u8
+        self.0.len().div_ceil(2) as u8
     }
 
     // Ref: CIP Vol. 1, Message Router request format - Request_Path_Size is a USINT count of
     // 16-bit words (section unverified). Errors if the path exceeds 255 words (510 bytes).
     // Deviation from Go, which truncated silently.
     pub fn try_len_words(&self) -> Result<u8> {
-        let w = (self.0.len() + 1) / 2;
+        let w = self.0.len().div_ceil(2);
         u8::try_from(w).map_err(|_| {
             CipError::Other(format!("cip: path of {} bytes exceeds 510 bytes", self.0.len()))
         })

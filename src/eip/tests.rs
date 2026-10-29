@@ -448,7 +448,7 @@ fn list_identity_round_trip_and_skip_unknown() {
         state: 3,
         ..Default::default()
     };
-    let mut data = encode_list_identity_response(&[it.clone()]).unwrap();
+    let mut data = encode_list_identity_response(std::slice::from_ref(&it)).unwrap();
     let got = decode_list_identity_response(&data).unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].length, 34 + 8);

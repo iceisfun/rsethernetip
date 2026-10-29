@@ -359,8 +359,8 @@ impl Server {
             // Enforce max-client limit (implementation detail, not spec). The slot is reserved
             // here, before spawning, via `active`, so back-to-back accepts cannot bypass it.
             let reserved = inner.active.fetch_add(1, Ordering::SeqCst) + 1;
-            if inner.max_clients > 0 {
-                if reserved > inner.max_clients {
+            if inner.max_clients > 0
+                && reserved > inner.max_clients {
                     inner.active.fetch_sub(1, Ordering::SeqCst);
                     inner.logger.warn(format_args!(
                         "max clients ({}) reached, rejecting {}",
@@ -369,7 +369,6 @@ impl Server {
                     let _ = conn.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
-            }
 
             let srv = self.clone();
             let h = thread::spawn(move || {

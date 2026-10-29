@@ -47,6 +47,9 @@ pub trait Transport<C>: Send + Sync {
 }
 
 // Implementation detail (not spec): lifecycle hook storage (Go `transport.Config`).
+/// Callback fired when a connection is lost or closed.
+pub type DisconnectHook = Arc<dyn Fn(Option<&Error>) + Send + Sync>;
+
 /// Lifecycle hooks shared by all transport implementations.
 #[derive(Clone, Default)]
 pub struct Config {
@@ -54,7 +57,7 @@ pub struct Config {
     pub on_connect: Vec<Arc<dyn Fn() + Send + Sync>>,
     /// Callbacks fired when a connection is lost or closed; the argument is the
     /// result of the underlying close call.
-    pub on_disconnect: Vec<Arc<dyn Fn(Option<&Error>) + Send + Sync>>,
+    pub on_disconnect: Vec<DisconnectHook>,
 }
 
 impl Config {
@@ -78,7 +81,7 @@ pub enum TransportOption {
     /// Registers a callback fired after a connection is established.
     OnConnect(Arc<dyn Fn() + Send + Sync>),
     /// Registers a callback fired when a connection is lost.
-    OnDisconnect(Arc<dyn Fn(Option<&Error>) + Send + Sync>),
+    OnDisconnect(DisconnectHook),
 }
 
 /// Registers a callback that fires after a connection is established.

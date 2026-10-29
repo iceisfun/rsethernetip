@@ -74,11 +74,10 @@ fn build_class1_cpf_packet(conn_id: u32, seq: u16, payload: &[u8]) -> Vec<u8> {
 fn wait_for_data(ao: &AssemblyObject, id: u32, want: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if let Ok(d) = ao.get_attribute_single(id, 3) {
-            if d == want {
+        if let Ok(d) = ao.get_attribute_single(id, 3)
+            && d == want {
                 return;
             }
-        }
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("assembly data = {:02X?}, want {:02X?}", ao.get_attribute_single(id, 3), want);

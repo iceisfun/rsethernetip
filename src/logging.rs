@@ -244,11 +244,10 @@ impl DefaultLogger {
             b.push('\n');
         }
         let mut s = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = s.writer.write_all(b.as_bytes()) {
-            if !s.is_stderr {
+        if let Err(e) = s.writer.write_all(b.as_bytes())
+            && !s.is_stderr {
                 eprintln!("ERROR: Failed to write log entry: {e}");
             }
-        }
     }
 
     // Go formats fields as key="value" (%q) in map order (random); we sort.

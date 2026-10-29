@@ -271,7 +271,7 @@ fn plc_reader_writer_traits() {
     let c = client(&addr);
     let ctx = Context::background();
     let dp: Arc<dyn DataPoint> = Arc::new(Tag::new("MyDINT"));
-    let vals = Reader::read(&c, &ctx, &[dp.clone()]).unwrap();
+    let vals = Reader::read(&c, &ctx, std::slice::from_ref(&dp)).unwrap();
     assert_eq!(vals.len(), 1);
     assert_eq!(vals[0].int().unwrap(), 12345);
     let mut raw = TYPE_DINT.0.to_le_bytes().to_vec();

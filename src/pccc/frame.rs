@@ -492,6 +492,7 @@ mod tests {
     fn encode_typed_write_validates() {
         let i = FileType::INTEGER;
         let d: &[u8] = &[0, 0];
+        #[allow(clippy::type_complexity)]
         let cases: [(&str, i64, i64, i64, FileType, &[u8]); 6] = [
             ("nil data", 7, 0, 0, i, &[]),
             ("empty data", 7, 0, 0, i, &[]),

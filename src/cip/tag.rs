@@ -84,12 +84,11 @@ fn split_tag_segments(tag: &str) -> Result<Vec<&str>> {
                 }
                 depth -= 1;
             }
-            b'.' => {
-                if depth == 0 {
+            b'.'
+                if depth == 0 => {
                     parts.push(&tag[start..i]);
                     start = i + 1;
                 }
-            }
             _ => {}
         }
     }

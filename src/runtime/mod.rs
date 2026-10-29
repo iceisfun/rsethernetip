@@ -184,11 +184,10 @@ impl Runtime {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&conn_id);
-        if let Some(c) = conn {
-            if let Some(s) = c.stop_chan {
+        if let Some(c) = conn
+            && let Some(s) = c.stop_chan {
                 s.close();
             }
-        }
     }
 
     /// Local UDP address the runtime listens on, or `None` if not started.
@@ -271,11 +270,10 @@ impl Runtime {
             }
         }
         for id in expired {
-            if let Some(c) = map.remove(&id) {
-                if let Some(s) = c.stop_chan {
+            if let Some(c) = map.remove(&id)
+                && let Some(s) = c.stop_chan {
                     s.close();
                 }
-            }
         }
     }
 

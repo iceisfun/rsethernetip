@@ -110,6 +110,8 @@ fn parse_symbolic_segment(path: &Path) -> Result<String, String> {
     }
 }
 
+// 3.14 is demo data, not an approximation of PI.
+#[allow(clippy::approx_constant)]
 fn main() {
     let args = Cli::new("ethernetip-server", "Serves Logix-style tags over EtherNet/IP.")
         .flag("addr", ":44818", "TCP address to listen on (host:port)")

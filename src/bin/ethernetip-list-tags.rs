@@ -69,8 +69,8 @@ fn main() {
     }
 
     println!("Found {} tags:\n", tags.len());
-    println!("  {:<10}  {:<40}  {}", "Instance", "Name", "Type");
-    println!("  {:<10}  {:<40}  {}", "--------", "----", "----");
+    println!("  {:<10}  {:<40}  Type", "Instance", "Name");
+    println!("  {:<10}  {:<40}  ----", "--------", "----");
 
     for tag in &tags {
         // DataType Display resolves the code to a name; the array bit (0x8000) appends "[]".

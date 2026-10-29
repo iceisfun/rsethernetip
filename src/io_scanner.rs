@@ -411,11 +411,10 @@ impl IoScanner {
 
         let mut first_err: Option<Error> = None;
         for c in &conns {
-            if let Err(e) = self.close(ctx, c) {
-                if first_err.is_none() {
+            if let Err(e) = self.close(ctx, c)
+                && first_err.is_none() {
                     first_err = Some(e);
                 }
-            }
         }
 
         self.shared.done.store(true, Ordering::SeqCst);
@@ -927,11 +926,10 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if let Ok(data) = ao.get_attribute_single(100, 3) {
-                if data == output_data {
+            if let Ok(data) = ao.get_attribute_single(100, 3)
+                && data == output_data {
                     break;
                 }
-            }
             std::thread::sleep(Duration::from_millis(5));
         }
 

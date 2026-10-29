@@ -726,6 +726,7 @@ pub fn read_slice<T: Unmarshaler + SizedCip + Default + Clone>(c: &Client, ctx: 
 // Implementation detail: ported tests from Go ethernetip_test.go (client side) against the
 // in-test fake target, plus retry/reconnect behavior tests.
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::cip::{MessageRouter, MessageRouterResponse, TYPE_BOOL, TYPE_DINT, TYPE_REAL};

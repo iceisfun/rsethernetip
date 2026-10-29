@@ -640,9 +640,7 @@ mod tests {
     // Go TestHexDumpEIPRegisterSession
     #[test]
     fn hexdump_eip_register_session() {
-        let (_t, clientconn) = (FakeTarget::start(Arc::new(MessageRouter::new())), ());
-        let _ = clientconn;
-        let t = _t;
+        let t = FakeTarget::start(Arc::new(MessageRouter::new()));
         let buf = SharedBuf::default();
         let s = TcpStream::connect(&t.addr).unwrap();
         let tc = TcpConn::new("", &[with_conn(s), with_hex_dump(buf.clone())]).unwrap();

@@ -139,6 +139,7 @@ pub fn go_type_to_cip_type<T: CipTyped + ?Sized>(v: &T) -> Result<DataType> {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::cip::decode::unmarshal;

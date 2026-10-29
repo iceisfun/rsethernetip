@@ -90,11 +90,10 @@ impl Scheduler {
                 if !c.is_producer {
                     continue;
                 }
-                if let Some(ls) = c.last_send {
-                    if now.saturating_duration_since(ls) < c.rpi {
+                if let Some(ls) = c.last_send
+                    && now.saturating_duration_since(ls) < c.rpi {
                         continue;
                     }
-                }
                 let asm = match &c.assembly {
                     Some(a) => a.clone(),
                     None => continue,
